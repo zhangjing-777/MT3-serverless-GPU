@@ -1,79 +1,240 @@
+import functools
+import numpy as np
+import tensorflow.compat.v2 as tf
+import jax
+import librosa
 import note_seq
+import seqio
+import t5
+import t5x
+import gin
 import tempfile
-import os
 
-# Note: MT3 的实际导入和使用可能需要根据实际 API 调整
+from mt3 import metrics_utils
+from mt3 import models
+from mt3 import network
+from mt3 import note_sequences
+from mt3 import preprocessors
+from mt3 import spectrograms
+from mt3 import vocabularies
 
 # Global model
-_model = None
+_inference_model = None
+
+class InferenceModel(object):
+    """MT3 推理模型（从 Colab 复制）"""
+
+    def __init__(self, checkpoint_path, model_type='mt3'):
+        if model_type == 'mt3':
+            num_velocity_bins = 1
+            self.encoding_spec = note_sequences.NoteEncodingWithTiesSpec
+            self.inputs_length = 256
+        else:
+            raise ValueError('Only mt3 model supported')
+
+        gin_files = ['/content/mt3/gin/model.gin',
+                     f'/content/mt3/gin/{model_type}.gin']
+
+        self.batch_size = 8
+        self.outputs_length = 1024
+        self.sequence_length = {'inputs': self.inputs_length,
+                                'targets': self.outputs_length}
+
+        self.partitioner = t5x.partitioning.PjitPartitioner(num_partitions=1)
+
+        self.spectrogram_config = spectrograms.SpectrogramConfig()
+        self.codec = vocabularies.build_codec(
+            vocab_config=vocabularies.VocabularyConfig(
+                num_velocity_bins=num_velocity_bins))
+        self.vocabulary = vocabularies.vocabulary_from_codec(self.codec)
+        self.output_features = {
+            'inputs': seqio.ContinuousFeature(dtype=tf.float32, rank=2),
+            'targets': seqio.Feature(vocabulary=self.vocabulary),
+        }
+
+        self._parse_gin(gin_files)
+        self.model = self._load_model()
+        self.restore_from_checkpoint(checkpoint_path)
+        
+        print("MT3 model loaded successfully!")
+
+    @property
+    def input_shapes(self):
+        return {
+            'encoder_input_tokens': (self.batch_size, self.inputs_length),
+            'decoder_input_tokens': (self.batch_size, self.outputs_length)
+        }
+
+    def _parse_gin(self, gin_files):
+        gin_bindings = [
+            'from __gin__ import dynamic_registration',
+            'from mt3 import vocabularies',
+            'VOCAB_CONFIG=@vocabularies.VocabularyConfig()',
+            'vocabularies.VocabularyConfig.num_velocity_bins=%NUM_VELOCITY_BINS'
+        ]
+        with gin.unlock_config():
+            gin.parse_config_files_and_bindings(
+                gin_files, gin_bindings, finalize_config=False)
+
+    def _load_model(self):
+        model_config = gin.get_configurable(network.T5Config)()
+        module = network.Transformer(config=model_config)
+        return models.ContinuousInputsEncoderDecoderModel(
+            module=module,
+            input_vocabulary=self.output_features['inputs'].vocabulary,
+            output_vocabulary=self.output_features['targets'].vocabulary,
+            optimizer_def=t5x.adafactor.Adafactor(decay_rate=0.8, step_offset=0),
+            input_depth=spectrograms.input_depth(self.spectrogram_config))
+
+    def restore_from_checkpoint(self, checkpoint_path):
+        train_state_initializer = t5x.utils.TrainStateInitializer(
+            optimizer_def=self.model.optimizer_def,
+            init_fn=self.model.get_initial_variables,
+            input_shapes=self.input_shapes,
+            partitioner=self.partitioner)
+
+        restore_checkpoint_cfg = t5x.utils.RestoreCheckpointConfig(
+            path=checkpoint_path, mode='specific', dtype='float32')
+
+        train_state_axes = train_state_initializer.train_state_axes
+        self._predict_fn = self._get_predict_fn(train_state_axes)
+        self._train_state = train_state_initializer.from_checkpoint_or_scratch(
+            [restore_checkpoint_cfg], init_rng=jax.random.PRNGKey(0))
+
+    @functools.lru_cache()
+    def _get_predict_fn(self, train_state_axes):
+        def partial_predict_fn(params, batch, decode_rng):
+            return self.model.predict_batch_with_aux(
+                params, batch, decoder_params={'decode_rng': None})
+        return self.partitioner.partition(
+            partial_predict_fn,
+            in_axis_resources=(
+                train_state_axes.params,
+                t5x.partitioning.PartitionSpec('data',), None),
+            out_axis_resources=t5x.partitioning.PartitionSpec('data',)
+        )
+
+    def predict_tokens(self, batch, seed=0):
+        prediction, _ = self._predict_fn(
+            self._train_state.params, batch, jax.random.PRNGKey(seed))
+        return self.vocabulary.decode_tf(prediction).numpy()
+
+    def __call__(self, audio):
+        ds = self.audio_to_dataset(audio)
+        ds = self.preprocess(ds)
+
+        model_ds = self.model.FEATURE_CONVERTER_CLS(pack=False)(
+            ds, task_feature_lengths=self.sequence_length)
+        model_ds = model_ds.batch(self.batch_size)
+
+        inferences = (tokens for batch in model_ds.as_numpy_iterator()
+                      for tokens in self.predict_tokens(batch))
+
+        predictions = []
+        for example, tokens in zip(ds.as_numpy_iterator(), inferences):
+            predictions.append(self.postprocess(tokens, example))
+
+        result = metrics_utils.event_predictions_to_ns(
+            predictions, codec=self.codec, encoding_spec=self.encoding_spec)
+        return result['est_ns']
+
+    def audio_to_dataset(self, audio):
+        frames, frame_times = self._audio_to_frames(audio)
+        return tf.data.Dataset.from_tensors({
+            'inputs': frames,
+            'input_times': frame_times,
+        })
+
+    def _audio_to_frames(self, audio):
+        frame_size = self.spectrogram_config.hop_width
+        padding = [0, frame_size - len(audio) % frame_size]
+        audio = np.pad(audio, padding, mode='constant')
+        frames = spectrograms.split_audio(audio, self.spectrogram_config)
+        num_frames = len(audio) // frame_size
+        times = np.arange(num_frames) / self.spectrogram_config.frames_per_second
+        return frames, times
+
+    def preprocess(self, ds):
+        pp_chain = [
+            functools.partial(
+                t5.data.preprocessors.split_tokens_to_inputs_length,
+                sequence_length=self.sequence_length,
+                output_features=self.output_features,
+                feature_key='inputs',
+                additional_feature_keys=['input_times']),
+            preprocessors.add_dummy_targets,
+            functools.partial(
+                preprocessors.compute_spectrograms,
+                spectrogram_config=self.spectrogram_config)
+        ]
+        for pp in pp_chain:
+            ds = pp(ds)
+        return ds
+
+    def postprocess(self, tokens, example):
+        tokens = self._trim_eos(tokens)
+        start_time = example['input_times'][0]
+        start_time -= start_time % (1 / self.codec.steps_per_second)
+        return {
+            'est_tokens': tokens,
+            'start_time': start_time,
+            'raw_inputs': []
+        }
+
+    @staticmethod
+    def _trim_eos(tokens):
+        tokens = np.array(tokens, np.int32)
+        if vocabularies.DECODED_EOS_ID in tokens:
+            tokens = tokens[:np.argmax(tokens == vocabularies.DECODED_EOS_ID)]
+        return tokens
+
 
 def get_model():
-    """加载 MT3 模型"""
-    global _model
-    if _model is None:
+    """加载 MT3 模型（单例）"""
+    global _inference_model
+    
+    if _inference_model is None:
         print("Loading MT3 model...")
-        
-        # MT3 模型加载方式可能需要调整
-        # 这里是一个示例，具体取决于 mt3 库的 API
-        try:
-            import mt3
-            _model = mt3.models.MT3(
-                checkpoint_path='/mt3/checkpoints/mt3',
-                use_ddsp=False
-            )
-            print("Model loaded successfully!")
-        except Exception as e:
-            print(f"Error loading MT3 model: {e}")
-            print("Attempting alternative loading method...")
-            
-            # 备用方案：直接使用 note_seq
-            # 这取决于 MT3 的实际实现
-            _model = "mt3_placeholder"
-            
-    return _model
+        checkpoint_path = '/content/checkpoints/mt3/'
+        _inference_model = InferenceModel(checkpoint_path, model_type='mt3')
+    
+    return _inference_model
+
 
 def transcribe_mt3(audio_path: str):
     """
-    Transcribe audio to MIDI using MT3
+    使用 MT3 转录音频为 MIDI
     """
     print(f"Loading audio from {audio_path}")
     
-    try:
-        import tensorflow as tf
-        
-        # Load audio
-        audio, sample_rate = tf.audio.decode_wav(tf.io.read_file(audio_path))
-        audio = tf.squeeze(audio, axis=-1)
-        
-        print(f"Audio loaded: {len(audio)} samples at {sample_rate}Hz")
-        
-        # Get model
-        model = get_model()
-        
-        # Run inference
-        print("Running MT3 transcription...")
-        
-        # 这里需要根据 MT3 的实际 API 调整
-        if hasattr(model, 'predict_notes'):
-            note_sequences = model.predict_notes(audio, sample_rate)
-        else:
-            # 备用方案
-            print("Using alternative transcription method")
-            # 创建一个基本的 MIDI 序列
-            note_sequences = [note_seq.protobuf.music_pb2.NoteSequence()]
-        
-        # Save to MIDI
-        temp_midi = tempfile.NamedTemporaryFile(delete=False, suffix=".mid")
-        midi_path = temp_midi.name
-        temp_midi.close()
-        
-        note_seq.sequence_proto_to_midi_file(note_sequences[0], midi_path)
-        
-        print(f"Transcription complete, saved to {midi_path}")
-        return midi_path
-        
-    except Exception as e:
-        print(f"Error during transcription: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    # 加载音频（16kHz）
+    SAMPLE_RATE = 16000
+    audio, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
+    
+    print(f"Audio loaded: {len(audio)} samples at {sr}Hz")
+    print(f"Duration: {len(audio) / sr:.2f} seconds")
+    
+    # 获取模型
+    model = get_model()
+    
+    # 转录
+    print("Running MT3 transcription...")
+    note_sequence = model(audio)
+    
+    # 保存为 MIDI
+    temp_midi = tempfile.NamedTemporaryFile(delete=False, suffix=".mid")
+    midi_path = temp_midi.name
+    temp_midi.close()
+    
+    note_seq.sequence_proto_to_midi_file(note_sequence, midi_path)
+    
+    # 统计信息
+    num_notes = sum(1 for note in note_sequence.notes if not note.is_drum)
+    num_drum_notes = sum(1 for note in note_sequence.notes if note.is_drum)
+    
+    print(f"Transcription complete!")
+    print(f"  Notes: {num_notes}")
+    print(f"  Drum notes: {num_drum_notes}")
+    print(f"  Saved to: {midi_path}")
+    
+    return midi_path
