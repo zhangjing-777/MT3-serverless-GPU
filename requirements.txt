@@ -1,6 +1,0 @@
-runpod
-tensorflow==2.12.0
-note-seq
-librosa
-pretty-midi
-mir-eval
