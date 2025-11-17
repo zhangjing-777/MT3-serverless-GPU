@@ -1,18 +1,17 @@
 FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
 
-# 系统依赖（包含 git）
+# 系统依赖
 RUN apt-get update -qq && apt-get install -qq \
     libfluidsynth3 \
     build-essential \
     libasound2-dev \
     libjack-dev \
     git \
-    curl \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 gsutil（先装，后面要用）
-RUN curl https://sdk.cloud.google.com | bash
-ENV PATH=$PATH:/root/google-cloud-sdk/bin
+# 用 pip 安装 gsutil
+RUN pip install gsutil
 
 # 安装 MT3
 WORKDIR /content
