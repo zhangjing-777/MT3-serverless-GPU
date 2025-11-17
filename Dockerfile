@@ -7,9 +7,17 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsndfile1 \
     fluidsynth \
-    git \
-    wget \
+    build-essential \
+    libasound2-dev \
+    libjack-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------
+# Install gsutil
+# ---------------------------
+RUN curl https://sdk.cloud.google.com | bash
+ENV PATH=$PATH:/root/google-cloud-sdk/bin
 
 # ---------------------------
 # Install Python Dependencies
@@ -17,28 +25,27 @@ RUN apt-get update && apt-get install -y \
 RUN pip install --upgrade pip && \
     pip install runpod \
     boto3 \
-    tensorflow==2.12.0 \
-    note-seq \
+    jax[cuda12] \
+    nest-asyncio \
+    pyfluidsynth==1.3.0 \
     librosa \
-    pretty-midi \
-    mir-eval
+    note_seq \
+    t5[gcp] \
+    t5x \
+    seqio
 
 # ---------------------------
-# Clone MT3 repository
+# Clone and install MT3
 # ---------------------------
-WORKDIR /mt3
-RUN git clone https://github.com/magenta/mt3.git . && \
+WORKDIR /content
+RUN git clone --branch=main https://github.com/magenta/mt3 && \
+    cd mt3 && \
     pip install -e .
 
 # ---------------------------
-# Download MT3 checkpoint (手动下载，不用 gsutil)
+# Download MT3 checkpoints
 # ---------------------------
-RUN mkdir -p /mt3/checkpoints/mt3 && \
-    cd /mt3/checkpoints && \
-    wget -q https://storage.googleapis.com/magentadata/models/mt3/checkpoints/mt3.gin -O mt3/config.gin || echo "Config download failed" && \
-    wget -q https://storage.googleapis.com/magentadata/models/mt3/checkpoints/checkpoint || echo "Checkpoint list failed"
-
-# Note: MT3 模型可能需要在首次运行时下载
+RUN gsutil -q -m cp -r gs://mt3/checkpoints /content/checkpoints
 
 # ---------------------------
 # Set working directory
