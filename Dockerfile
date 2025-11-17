@@ -1,5 +1,5 @@
 FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
-# Force rebuild - v2
+
 # ---------------------------
 # Install system dependencies
 # ---------------------------
@@ -20,19 +20,21 @@ RUN curl https://sdk.cloud.google.com | bash
 ENV PATH=$PATH:/root/google-cloud-sdk/bin
 
 # ---------------------------
-# Install Python Dependencies
+# Install Python Dependencies (分步安装避免冲突)
 # ---------------------------
-RUN pip install --upgrade pip && \
-    pip install runpod \
-    boto3 \
-    jax[cuda12] \
-    nest-asyncio \
-    pyfluidsynth==1.3.0 \
-    librosa \
-    note_seq \
-    t5[gcp] \
-    t5x \
-    seqio
+RUN pip install --upgrade pip
+
+# 基础依赖
+RUN pip install runpod boto3 librosa nest-asyncio pyfluidsynth==1.3.0
+
+# JAX (单独安装)
+RUN pip install "jax[cuda12]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# T5 和 seqio
+RUN pip install note-seq seqio
+
+# T5X 相关
+RUN pip install "t5[gcp]" t5x
 
 # ---------------------------
 # Clone and install MT3
