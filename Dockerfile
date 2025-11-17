@@ -20,24 +20,21 @@ RUN curl https://sdk.cloud.google.com | bash
 ENV PATH=$PATH:/root/google-cloud-sdk/bin
 
 # ---------------------------
-# Install Python Dependencies (分步安装避免冲突)
+# Install Python Dependencies
 # ---------------------------
 RUN pip install --upgrade pip
 
 # 基础依赖
 RUN pip install runpod boto3 librosa nest-asyncio pyfluidsynth==1.3.0
 
-# JAX (单独安装)
-RUN pip install "jax[cuda12]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+# JAX
+RUN pip install "jax[cuda12]==0.4.20" jaxlib==0.4.20+cuda12.cudnn89 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
-# T5 和 seqio
-RUN pip install note-seq seqio
-
-# T5X 相关
-RUN pip install "t5[gcp]" t5x
+# 其他依赖
+RUN pip install note-seq
 
 # ---------------------------
-# Clone and install MT3
+# Clone and install MT3 (会自动安装 t5, t5x, seqio)
 # ---------------------------
 WORKDIR /content
 RUN git clone --branch=main https://github.com/magenta/mt3 && \
