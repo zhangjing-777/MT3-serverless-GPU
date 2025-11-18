@@ -1,38 +1,68 @@
 FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
 
-# 系统依赖
-RUN apt-get update -qq && apt-get install -qq \
-    libfluidsynth3 \
+# ---------------------------
+# Install system dependencies
+# ---------------------------
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libsndfile1 \
+    fluidsynth \
     build-essential \
     libasound2-dev \
     libjack-dev \
-    git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 用 pip 安装 gsutil
-RUN pip install gsutil
+# ---------------------------
+# Install gsutil
+# ---------------------------
+RUN curl https://sdk.cloud.google.com | bash
+ENV PATH=$PATH:/root/google-cloud-sdk/bin
 
-# 先装旧版本的 flax（兼容 jax 0.4.x）
-RUN pip install flax==0.6.0 jax==0.4.20 jaxlib==0.4.20+cuda11.cudnn86 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+# ---------------------------
+# Fix NumPy version first (critical!)
+# ---------------------------
+RUN pip install --upgrade pip && \
+    pip install "numpy<2.0"
 
-# 先装 runpod 和 boto3（带依赖）
-RUN pip install runpod boto3
+# ---------------------------
+# Install Python Dependencies
+# ---------------------------
+RUN pip install runpod \
+    boto3 \
+    "jax[cuda12_pip]==0.4.20" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html \
+    nest-asyncio \
+    pyfluidsynth==1.3.0 \
+    librosa \
+    note_seq \
+    t5[gcp] \
+    t5x \
+    seqio
 
-# 安装 MT3（会跳过已安装的 jax/flax）
-WORKDIR /content  
+# ---------------------------
+# Clone and install MT3
+# ---------------------------
+WORKDIR /content
 RUN git clone --branch=main https://github.com/magenta/mt3 && \
-    mv mt3 mt3_tmp && \
-    mv mt3_tmp/* . && \
-    rm -r mt3_tmp && \
-    pip install --no-deps nest-asyncio pyfluidsynth==1.3.0 -e .
+    cd mt3 && \
+    pip install -e .
 
-# 手动安装 MT3 的其他依赖（跳过 flax/jax）
-RUN pip install note-seq t5 gin-config seqio-nightly tensorflow
+# ---------------------------
+# Download MT3 checkpoints
+# ---------------------------
+RUN gsutil -q -m cp -r gs://mt3/checkpoints /content/checkpoints
 
-# 下载模型
-RUN gsutil -q -m cp -r gs://mt3/checkpoints .
-
+# ---------------------------
+# Set working directory
+# ---------------------------
 WORKDIR /app
+
+# ---------------------------
+# Copy source code
+# ---------------------------
 COPY src/ ./src/
 
+# ---------------------------
+# Serverless entrypoint
+# ---------------------------
 CMD ["python3", "-u", "src/handler.py"]
