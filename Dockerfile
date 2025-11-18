@@ -32,4 +32,5 @@ RUN gsutil -q -m cp -r gs://mt3/checkpoints .
 WORKDIR /app
 COPY src/ ./src/
 
-CMD ["python3", "-u", "src/handler.py"]
+# 修改这一行 - 添加调试输出
+CMD ["bash", "-c", "echo '=== Container Started ==='; pwd; echo '=== Listing files ==='; ls -la; ls -la src/; echo '=== Python version ==='; python3 --version; echo '=== Starting handler ==='; python3 -u src/handler.py 2>&1 || (echo 'Handler failed'; sleep 300)"]
